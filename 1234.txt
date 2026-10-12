@@ -1,0 +1,216 @@
+#pragma once
+#include <Windows.h>
+#include <d3d11.h>
+#include <vector>
+#include <cmath>
+#include <algorithm>
+#include "Memory.h"
+
+// ================== CẤU HÌNH ==================
+struct Config {
+    // ESP
+    bool  espEnabled   = true;
+    bool  espBox       = true;
+    bool  espName      = true;
+    bool  espHealth    = true;
+    bool  espLine      = false;
+    bool  espSkeleton  = false;
+    float espColor[4]  = { 1.f, 0.f, 0.f, 1.f }; // đỏ
+    float teamColor[4] = { 0.f, 1.f, 0.f, 1.f }; // xanh
+    float maxDistance  = 300.f;
+
+    // AIM
+    bool  aimEnabled   = false;
+    bool  aimVisible   = true;
+    bool  aimTeamCheck = true;
+    float aimFov       = 90.f;
+    float aimSmooth    = 5.f;
+    int   aimBone      = 1;    // 0=head, 1=neck, 2=chest
+    int   aimKey       = VK_RBUTTON;
+
+    // Misc
+    bool  teamCheckESP = true;
+} cfg;
+
+// ================== ENTITY ==================
+struct Entity {
+    uintptr_t address   = 0;
+    int       team      = 0;
+    int       health    = 100;
+    float     distance  = 0.f;
+    char      name[32]  = { 0 };
+
+    // Vị trí thế giới
+    float pos[3]        = { 0,0,0 };
+    float headPos[3]    = { 0,0,0 };
+    float neckPos[3]    = { 0,0,0 };
+
+    // Vị trí màn hình
+    float screenHead[2] = { 0,0 };
+    float screenFeet[2] = { 0,0 };
+    float screenNeck[2] = { 0,0 };
+};
+
+// ================== FEATURES ==================
+class Features {
+public:
+    Memory* mem = nullptr;
+    std::vector<Entity> entities;
+    int localTeam = 0;
+
+    // --- Offsets (ví dụ - cần thay theo game thật) ---
+    const uintptr_t OFF_ENTITY_LIST   = 0x0;
+    const uintptr_t OFF_LOCAL_PLAYER  = 0x0;
+    const uintptr_t OFF_TEAM          = 0x0;
+    const uintptr_t OFF_HEALTH        = 0x0;
+    const uintptr_t OFF_POS           = 0x0;
+    const uintptr_t OFF_HEAD          = 0x0;
+    const uintptr_t OFF_VIEW_MATRIX   = 0x0;
+
+    float viewMatrix[16] = { 0 };
+    int screenW = 1920, screenH = 1080;
+
+    // ============ TEAM CHECK ============
+    bool IsSameTeam(const Entity& e) {
+        return e.team == localTeam;
+    }
+
+    // ============ SCAN ============
+    void UpdateEntities() {
+        entities.clear();
+        if (!mem || !mem->hProcess) return;
+
+        // Lấy team người chơi
+        uintptr_t local = mem->Read<uintptr_t>(mem->moduleBase + OFF_LOCAL_PLAYER);
+        if (!local) return;
+        localTeam = mem->Read<int>(local + OFF_TEAM);
+
+        // Đọc view matrix
+        memcpy(viewMatrix, (void*)(mem->moduleBase + OFF_VIEW_MATRIX), sizeof(viewMatrix));
+
+        // Duyệt danh sách entity
+        uintptr_t list = mem->Read<uintptr_t>(mem->moduleBase + OFF_ENTITY_LIST);
+        if (!list) return;
+
+        for (int i = 0; i < 64; i++) {
+            uintptr_t ent = mem->Read<uintptr_t>(list + i * 0x10);
+            if (!ent || ent == local) continue;
+
+            Entity e{};
+            e.address = ent;
+            e.team    = mem->Read<int>(ent + OFF_TEAM);
+            e.health  = mem->Read<int>(ent + OFF_HEALTH);
+            if (e.health <= 0 || e.health > 100) continue;
+
+            // Đọc vị trí
+            memcpy(e.pos,      (void*)(ent + OFF_POS),  sizeof(float) * 3);
+            memcpy(e.headPos,  (void*)(ent + OFF_HEAD), sizeof(float) * 3);
+            e.neckPos[0] = e.headPos[0];
+            e.neckPos[1] = e.headPos[1] - 5.f;
+            e.neckPos[2] = e.headPos[2];
+
+            // Team check ESP
+            if (cfg.teamCheckESP && IsSameTeam(e)) continue;
+
+            // Tính khoảng cách
+            uintptr_t lp = mem->Read<uintptr_t>(mem->moduleBase + OFF_LOCAL_PLAYER);
+            float lpos[3];
+            memcpy(lpos, (void*)(lp + OFF_POS), sizeof(float) * 3);
+            e.distance = sqrtf(
+                powf(e.pos[0] - lpos[0], 2) +
+                powf(e.pos[1] - lpos[1], 2) +
+                powf(e.pos[2] - lpos[2], 2));
+
+            if (e.distance > cfg.maxDistance) continue;
+
+            // World → Screen
+            if (WorldToScreen(e.headPos, e.screenHead) &&
+                WorldToScreen(e.pos,     e.screenFeet) &&
+                WorldToScreen(e.neckPos, e.screenNeck)) {
+                entities.push_back(e);
+            }
+        }
+    }
+
+    // ============ WORLD → SCREEN ============
+    bool WorldToScreen(const float world[3], float out[2]) {
+        float clip[4];
+        clip[0] = world[0]*viewMatrix[0] + world[1]*viewMatrix[4] + world[2]*viewMatrix[8]  + viewMatrix[12];
+        clip[1] = world[0]*viewMatrix[1] + world[1]*viewMatrix[5] + world[2]*viewMatrix[9]  + viewMatrix[13];
+        clip[2] = world[0]*viewMatrix[2] + world[1]*viewMatrix[6] + world[2]*viewMatrix[10] + viewMatrix[14];
+        clip[3] = world[0]*viewMatrix[3] + world[1]*viewMatrix[7] + world[2]*viewMatrix[11] + viewMatrix[15];
+        if (clip[3] < 0.01f) return false;
+
+        float invW = 1.f / clip[3];
+        float ndcX = clip[0] * invW;
+        float ndcY = clip[1] * invW;
+
+        out[0] = (screenW * 0.5f) * (1.f + ndcX);
+        out[1] = (screenH * 0.5f) * (1.f - ndcY);
+        return true;
+    }
+
+    // ============ AIMBOT ============
+    Entity* GetBestTarget() {
+        if (entities.empty()) return nullptr;
+
+        float cx = screenW * 0.5f;
+        float cy = screenH * 0.5f;
+        float bestFov = cfg.aimFov;
+        Entity* best = nullptr;
+
+        for (auto& e : entities) {
+            // TEAM CHECK
+            if (cfg.aimTeamCheck && IsSameTeam(e)) continue;
+
+            // VISIBLE CHECK (raycast - giả lập)
+            if (cfg.aimVisible && !IsVisible(e)) continue;
+
+            // Chọn bone
+            float* target = e.screenHead;
+            if (cfg.aimBone == 1) target = e.screenNeck;
+            else if (cfg.aimBone == 2) target = e.screenFeet;
+
+            // FOV check
+            float dx = target[0] - cx;
+            float dy = target[1] - cy;
+            float dist = sqrtf(dx*dx + dy*dy);
+
+            if (dist < bestFov) {
+                bestFov = dist;
+                best = &e;
+            }
+        }
+        return best;
+    }
+
+    void RunAimbot() {
+        if (!cfg.aimEnabled) return;
+        if (cfg.aimKey && !(GetAsyncKeyState(cfg.aimKey) & 0x8000)) return;
+
+        Entity* target = GetBestTarget();
+        if (!target) return;
+
+        float* bone = target->screenHead;
+        if (cfg.aimBone == 1) bone = target->screenNeck;
+        else if (cfg.aimBone == 2) bone = target->screenFeet;
+
+        float cx = screenW * 0.5f;
+        float cy = screenH * 0.5f;
+
+        float dx = bone[0] - cx;
+        float dy = bone[1] - cy;
+
+        // Smooth
+        dx /= cfg.aimSmooth;
+        dy /= cfg.aimSmooth;
+
+        // Di chuyển chuột
+        mouse_event(MOUSEEVENTF_MOVE, (DWORD)dx, (DWORD)dy, 0, 0);
+    }
+
+    bool IsVisible(const Entity& e) {
+        // TODO: raycast thực tế
+        return true;
+    }
+};
